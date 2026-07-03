@@ -6,7 +6,7 @@ import re
 
 app = FastAPI()
 
-# Enable CORS (required by the assignment)
+# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,16 +20,8 @@ class InvoiceRequest(BaseModel):
     invoice_text: str
 
 
-def search(patterns, text):
-    """Try multiple regex patterns and return the first match."""
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
-        if match:
-            return match.group(1).strip()
-    return None
-
-
 def clean_amount(value):
+    """Convert strings like 'Rs. 1,40,000.00' to float."""
     if value is None:
         return None
 
@@ -48,6 +40,22 @@ def clean_amount(value):
         return None
 
 
+def extract_line_value(text, labels):
+    """
+    Find a line beginning with one of the labels and
+    return everything after ':'.
+    """
+    for line in text.splitlines():
+        line = line.strip()
+
+        for label in labels:
+            if re.match(rf"^{label}\s*:?", line, re.IGNORECASE):
+                value = re.sub(rf"^{label}\s*:?\s*", "", line, flags=re.IGNORECASE)
+                return value.strip()
+
+    return None
+
+
 @app.post("/extract")
 def extract(req: InvoiceRequest):
 
@@ -55,56 +63,88 @@ def extract(req: InvoiceRequest):
 
     # ---------------- Invoice Number ----------------
 
-    invoice_no = search([
-        r"Invoice\s*(?:No|Number|#)?\.?\s*:?\s*([^\n]+)",
-        r"Bill\s*(?:No|Number)?\.?\s*:?\s*([^\n]+)",
-        r"Ref(?:erence)?\.?\s*:?\s*([^\n]+)",
-    ], text)
+    invoice_no = extract_line_value(
+        text,
+        [
+            r"Invoice No\.?",
+            r"Invoice Number",
+            r"Invoice #",
+            r"Invoice",
+            r"Bill No\.?",
+            r"Bill Number",
+            r"Ref",
+            r"Reference",
+        ],
+    )
 
     # ---------------- Vendor ----------------
 
-    vendor = search([
-        r"Vendor\s*:?\s*([^\n]+)",
-        r"Supplier\s*:?\s*([^\n]+)",
-        r"Seller\s*:?\s*([^\n]+)",
-        r"From\s*:?\s*([^\n]+)",
-    ], text)
+    vendor = extract_line_value(
+        text,
+        [
+            r"Vendor",
+            r"Supplier",
+            r"Seller",
+            r"From",
+        ],
+    )
 
     # ---------------- Date ----------------
 
-    date_str = search([
-        r"Invoice\s*Date\s*:?\s*([^\n]+)",
-        r"Date\s*:?\s*([^\n]+)",
-        r"Issued\s*:?\s*([^\n]+)",
-    ], text)
+    date_str = extract_line_value(
+        text,
+        [
+            r"Invoice Date",
+            r"Date",
+            r"Issued",
+        ],
+    )
 
     iso_date = None
-
     if date_str:
         try:
             iso_date = parser.parse(date_str).date().isoformat()
         except:
             iso_date = None
 
-    # ---------------- Amount (Subtotal) ----------------
+    # ---------------- Amount ----------------
 
-    subtotal = search([
+    subtotal = None
+
+    subtotal_patterns = [
         r"Subtotal.*?(?:Rs\.?|₹|\$)?\s*([\d,]+(?:\.\d+)?)",
         r"Sub\s*Total.*?(?:Rs\.?|₹|\$)?\s*([\d,]+(?:\.\d+)?)",
         r"Amount\s*Before\s*Tax.*?(?:Rs\.?|₹|\$)?\s*([\d,]+(?:\.\d+)?)",
-    ], text)
+    ]
+
+    for pattern in subtotal_patterns:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            subtotal = m.group(1)
+            break
 
     # ---------------- Tax ----------------
 
-    tax = search([
+    tax = None
+
+    tax_patterns = [
         r"(?:GST|CGST|SGST|IGST|VAT|Tax).*?(?:Rs\.?|₹|\$)?\s*([\d,]+(?:\.\d+)?)",
-    ], text)
+    ]
+
+    for pattern in tax_patterns:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            tax = m.group(1)
+            break
 
     # ---------------- Currency ----------------
 
-    currency = search([
-        r"Currency\s*:?\s*([A-Z]{3})"
-    ], text)
+    currency = extract_line_value(
+        text,
+        [
+            r"Currency",
+        ],
+    )
 
     if currency is None:
         if "₹" in text or "Rs" in text:
@@ -115,8 +155,6 @@ def extract(req: InvoiceRequest):
             currency = "EUR"
         elif "£" in text:
             currency = "GBP"
-
-    # ---------------- Response ----------------
 
     return {
         "invoice_no": invoice_no,
